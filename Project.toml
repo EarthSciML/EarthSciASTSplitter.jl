@@ -1,0 +1,31 @@
+name = "EarthSciASTSplitter"
+uuid = "9db91454-864a-4b1e-81d2-80df174b7aae"
+authors = ["EarthSciML Authors and Contributors"]
+version = "0.1.0"
+
+[deps]
+EarthSciAST = "c7bf5e87-b31b-4281-bdce-ffb8a46ec87c"
+
+[weakdeps]
+OrdinaryDiffEqOperatorSplitting = "760fc936-9fa0-4281-9c1a-468957eedc89"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+
+[extensions]
+EarthSciASTSplitterOperatorSplittingExt = ["OrdinaryDiffEqOperatorSplitting", "SciMLBase"]
+EarthSciASTSplitterSciMLBaseExt = "SciMLBase"
+
+[compat]
+EarthSciAST = "0.8"
+OrdinaryDiffEqLowOrderRK = "1, 2"
+OrdinaryDiffEqOperatorSplitting = "0.3"
+SciMLBase = "2, 3"
+julia = "1.10"
+
+[extras]
+OrdinaryDiffEqLowOrderRK = "1344f307-1e59-4825-a18e-ace9aa3fa4c6"
+OrdinaryDiffEqOperatorSplitting = "760fc936-9fa0-4281-9c1a-468957eedc89"
+SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test", "SciMLBase", "OrdinaryDiffEqOperatorSplitting", "OrdinaryDiffEqLowOrderRK"]

@@ -1,0 +1,299 @@
+{
+ "esm": "0.8.0",
+ "index_sets": {
+  "x": {
+   "kind": "interval",
+   "size": 8
+  }
+ },
+ "metadata": {
+  "name": "reaction_advection_1d",
+  "description": "Self-contained discretized 1-D periodic advection + linear-decay reaction (N=8) for EarthSciASTSplitter tests.",
+  "license": "MIT"
+ },
+ "models": {
+  "M": {
+   "equations": [
+    {
+     "lhs": {
+      "args": [
+       "u"
+      ],
+      "op": "ic"
+     },
+     "rhs": {
+      "op": "sin",
+      "args": [
+       {
+        "op": "*",
+        "args": [
+         6.283185307179586,
+         {
+          "op": "aggregate",
+          "output_idx": [
+           "i"
+          ],
+          "args": [],
+          "ranges": {
+           "i": {
+            "from": "x"
+           }
+          },
+          "expr": {
+           "op": "*",
+           "args": [
+            {
+             "op": "-",
+             "args": [
+              "i",
+              0.5
+             ]
+            },
+            {
+             "op": "/",
+             "args": [
+              1,
+              8
+             ]
+            }
+           ]
+          }
+         }
+        ]
+       }
+      ]
+     }
+    },
+    {
+     "lhs": {
+      "args": [
+       "u"
+      ],
+      "op": "D",
+      "wrt": "t"
+     },
+     "rhs": {
+      "op": "+",
+      "args": [
+       {
+        "args": [
+         {
+          "args": [
+           "c"
+          ],
+          "op": "-"
+         },
+         {
+          "args": [],
+          "op": "makearray",
+          "regions": [
+           [
+            [
+             2,
+             7
+            ]
+           ],
+           [
+            [
+             1,
+             1
+            ]
+           ],
+           [
+            [
+             8,
+             8
+            ]
+           ]
+          ],
+          "values": [
+           {
+            "args": [
+             "u"
+            ],
+            "expr": {
+             "args": [
+              {
+               "args": [
+                {
+                 "args": [
+                  "u",
+                  {
+                   "args": [
+                    "i",
+                    1
+                   ],
+                   "op": "+"
+                  }
+                 ],
+                 "op": "index"
+                },
+                {
+                 "args": [
+                  "u",
+                  {
+                   "args": [
+                    "i",
+                    1
+                   ],
+                   "op": "-"
+                  }
+                 ],
+                 "op": "index"
+                }
+               ],
+               "op": "-"
+              },
+              {
+               "args": [
+                2,
+                "dx"
+               ],
+               "op": "*"
+              }
+             ],
+             "op": "/"
+            },
+            "op": "aggregate",
+            "output_idx": [
+             "i"
+            ],
+            "ranges": {
+             "i": [
+              2,
+              7
+             ]
+            }
+           },
+           {
+            "args": [
+             {
+              "args": [
+               {
+                "args": [
+                 "u",
+                 2
+                ],
+                "op": "index"
+               },
+               {
+                "args": [
+                 "u",
+                 8
+                ],
+                "op": "index"
+               }
+              ],
+              "op": "-"
+             },
+             {
+              "args": [
+               2,
+               "dx"
+              ],
+              "op": "*"
+             }
+            ],
+            "op": "/"
+           },
+           {
+            "args": [
+             {
+              "args": [
+               {
+                "args": [
+                 "u",
+                 1
+                ],
+                "op": "index"
+               },
+               {
+                "args": [
+                 "u",
+                 {
+                  "args": [
+                   8,
+                   1
+                  ],
+                  "op": "-"
+                 }
+                ],
+                "op": "index"
+               }
+              ],
+              "op": "-"
+             },
+             {
+              "args": [
+               2,
+               "dx"
+              ],
+              "op": "*"
+             }
+            ],
+            "op": "/"
+           }
+          ]
+         }
+        ],
+        "op": "*"
+       },
+       {
+        "op": "*",
+        "args": [
+         {
+          "op": "-",
+          "args": [
+           "k"
+          ]
+         },
+         "u"
+        ]
+       }
+      ]
+     }
+    }
+   ],
+   "variables": {
+    "c": {
+     "default": 1,
+     "description": "Constant transport speed.",
+     "type": "parameter",
+     "units": "m/s"
+    },
+    "dx": {
+     "description": "Grid spacing 1/N = 1/8, spelled with the literal 8: the import edge binds N, closing it before this document's scope (grids/cartesian_uniform_1d/grid.esm contract).",
+     "expression": {
+      "args": [
+       1,
+       8
+      ],
+      "op": "/"
+     },
+     "type": "observed",
+     "units": "m"
+    },
+    "u": {
+     "description": "Advected tracer field over the x index set.",
+     "shape": [
+      "x"
+     ],
+     "type": "state",
+     "units": "kg/m^3"
+    },
+    "x0": {
+     "default": 0,
+     "description": "Left domain edge a = 0: the grid's x0 free name (consumer-supplied geometry contract).",
+     "type": "parameter",
+     "units": "m"
+    },
+    "k": {
+     "type": "parameter",
+     "units": "1/s",
+     "default": 0.5,
+     "description": "Linear decay rate."
+    }
+   }
+  }
+ }
+}
