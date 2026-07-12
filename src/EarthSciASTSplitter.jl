@@ -35,11 +35,9 @@ using EarthSciAST, EarthSciASTSplitter
 
 flat = flatten(load("model.esm"))          # or flatten(model)
 
-# A rule maps one additive term (an `ASTExpr`) to a part index in 1:nparts.
-# Example: put stencil/transport terms in part 1 (implicit), the rest in part 2.
-rule = term -> contains_op(term, STENCIL_OPS) ? 1 : 2
-
-se = build_split_evaluator(flat, rule)      # nparts = 2 by default
+# The default rule `transport_vs_pointwise` puts spatially-coupled (transport)
+# terms in part 1 (implicit) and pointwise (reaction) terms in part 2.
+se = build_split_evaluator(flat, transport_vs_pointwise)   # nparts = 2 by default
 # se.funcs :: NTuple of in-place f!(du,u,p,t); se.u0, se.p, se.tspan, se.var_map
 
 # IMEX (DiffEqDocs): du/dt = f1(u,p,t) + f2(u,p,t), f1 implicit.
@@ -51,8 +49,9 @@ prob = split_ode_problem(se)
 ```
 
 See [`split_system`](@ref), [`split_equations`](@ref),
-[`build_split_evaluator`](@ref), and the rule helpers [`references`](@ref),
-[`contains_op`](@ref), [`is_spatial_derivative`](@ref).
+[`build_split_evaluator`](@ref), the default rule [`transport_vs_pointwise`](@ref)
+(and its predicate [`spatially_coupled`](@ref)), and the generic rule helpers
+[`references`](@ref) and [`contains_op`](@ref).
 """
 module EarthSciASTSplitter
 
@@ -63,9 +62,8 @@ using EarthSciAST: ASTExpr, IntExpr, VarExpr, OpExpr, Equation, Model,
 export additive_terms, sum_terms,
        split_equations, split_system, build_split_evaluator, SplitEvaluator,
        split_ode_problem, operator_splitting_problem,
-       references, contains_op, is_spatial_derivative, has_stencil_op,
-       STENCIL_OPS, SPATIAL_DERIVATIVE_OPS,
-       stencil_vs_pointwise, spatial_vs_pointwise
+       TermContext, references, contains_op,
+       spatially_coupled, transport_vs_pointwise
 
 """
     split_ode_problem(se::SplitEvaluator; kwargs...)
@@ -92,30 +90,6 @@ vectors, one per part) to restrict them. Solve with a splitting algorithm, e.g.
 `EarthSciASTSplitterOperatorSplittingExt` package extension.
 """
 function operator_splitting_problem end
-
-# ---------------------------------------------------------------------------
-# Operator vocabularies (heuristics; users are free to define their own rules)
-# ---------------------------------------------------------------------------
-
-"""
-    STENCIL_OPS
-
-Array/stencil-producing operator names. A term containing one of these is, in a
-template-discretized system, almost always a transport/finite-difference term
-(the lowered form of a spatial derivative) rather than a pointwise reaction
-term. Intended as a starting heuristic for [`stencil_vs_pointwise`](@ref); the
-authoritative classification is whatever `rule` you pass.
-"""
-const STENCIL_OPS = ("makearray", "aggregate", "arrayop")
-
-"""
-    SPATIAL_DERIVATIVE_OPS
-
-Continuous spatial-differential operator names (pre-discretization). Used by
-[`is_spatial_derivative`](@ref) / [`spatial_vs_pointwise`](@ref) to split a
-system *before* its spatial operators have been lowered to stencils.
-"""
-const SPATIAL_DERIVATIVE_OPS = ("grad", "div", "laplacian")
 
 # ---------------------------------------------------------------------------
 # Additive decomposition
@@ -199,7 +173,8 @@ end
     contains_op(expr::ASTExpr, ops) -> Bool
 
 `true` if any `OpExpr` in `expr` has an `op` equal to `op` (or contained in the
-iterable `ops`, e.g. [`STENCIL_OPS`](@ref)).
+iterable `ops`). A generic building block for custom rules — note it says
+nothing about the *semantics* of an op (op names are not fixed by EarthSciAST).
 """
 contains_op(expr::ASTExpr, op::AbstractString)::Bool = contains_op(expr, (String(op),))
 
@@ -218,51 +193,177 @@ function _contains_op(expr::ASTExpr, ops)::Bool
     return false
 end
 
-"""
-    has_stencil_op(expr::ASTExpr) -> Bool
+# ---------------------------------------------------------------------------
+# Spatial-locality analysis — the real "transport vs pointwise" criterion
+#
+# EarthSciAST v0.8+ has NO distinguished spatial operators: `grad`/`div`/
+# `laplacian` are meaningless tokens, and discretization is done by expression
+# templates that lower a spatial derivative into whatever stencil AST they like
+# (`makearray`/`aggregate`/`arrayop`/`index`-gathers, …). So a transport term
+# cannot be recognized by any fixed op name.
+#
+# What *is* invariant is the DATA DEPENDENCY. In the (discretized) equation for
+# a state cell, a **pointwise** term reads state only at that same cell; a
+# **transport** (spatially coupled) term reads state at some OTHER cell — a
+# neighbor, a boundary cell, or a range it reduces over. That is exactly what
+# makes a term amenable to operator splitting, and it is representation-
+# independent: it holds whether the stencil is a `makearray`, a scalarized
+# `index(u, i-1)`, or an `aggregate` reduction.
+#
+# `spatially_coupled(term, ctx)` decides this by comparing, for every state
+# read in `term`, the cell it accesses against the equation's output cell.
+# ---------------------------------------------------------------------------
 
-`true` if `expr` contains any array/stencil op ([`STENCIL_OPS`](@ref)) — a
-heuristic for "this is a (discretized) transport term".
 """
-has_stencil_op(expr::ASTExpr)::Bool = contains_op(expr, STENCIL_OPS)
+    TermContext(lhs::ASTExpr, states::Set{String})
 
+The per-equation context a context-aware rule receives as its second argument:
+the equation's left-hand side `lhs` (e.g. `D(u)` or `D(index(u, i))`) and the
+set of state-variable base names `states`. Built automatically by
+[`split_equations`](@ref); most user rules ignore it (they take just the term).
 """
-    is_spatial_derivative(expr::ASTExpr) -> Bool
+struct TermContext
+    lhs::ASTExpr
+    states::Set{String}
+end
 
-`true` if `expr` contains a continuous spatial differential operator: any of
-[`SPATIAL_DERIVATIVE_OPS`](@ref) (`grad`/`div`/`laplacian`), or a `D` operator
-differentiating with respect to a spatial variable (`wrt != "t"`). Use this to
-split a system *before* discretization.
-"""
-function is_spatial_derivative(expr::ASTExpr)::Bool
-    if expr isa OpExpr
-        expr.op in SPATIAL_DERIVATIVE_OPS && return true
-        if expr.op == "D" && expr.wrt !== nothing && expr.wrt != "t"
-            return true
-        end
-        for a in expr.args
-            is_spatial_derivative(a) && return true
-        end
+# base variable name, stripping any `[...]` cell suffix (defensive; the AST
+# normally accesses cells via `index(u, …)`, not bracketed names).
+_base_name(name::AbstractString) = String(first(split(name, '['; limit=2)))
+
+# The state variable and output-cell index of a `D(...)` left-hand side.
+# Returns (base_name, cell) where `cell` is `nothing` for a whole-field / 0-D
+# state (`D(u)`) or a `Vector{ASTExpr}` index tuple for a specific cell
+# (`D(index(u, i))`). Returns (nothing, nothing) if `lhs` is not `D(state…)`.
+function _lhs_state_cell(lhs::ASTExpr)
+    (lhs isa OpExpr && lhs.op == "D" && !isempty(lhs.args)) || return (nothing, nothing)
+    inner = lhs.args[1]
+    inner isa VarExpr && return (_base_name(inner.name), nothing)
+    if inner isa OpExpr && inner.op == "index" && !isempty(inner.args) &&
+       inner.args[1] isa VarExpr
+        return (_base_name(inner.args[1].name), ASTExpr[inner.args[2:end]...])
+    end
+    return (nothing, nothing)
+end
+
+# The base state names declared by a set of equations (one per `D(state,t)`).
+function _state_base_names(equations)::Set{String}
+    s = Set{String}()
+    for eq in equations
+        _is_time_derivative_eq(eq) || continue
+        name, _ = _lhs_state_cell(eq.lhs)
+        name === nothing || push!(s, name)
+    end
+    return s
+end
+
+# Structural equality of two index expressions (`OpExpr`'s own `==` is identity).
+function _ast_equal(a::ASTExpr, b::ASTExpr)::Bool
+    a isa VarExpr && b isa VarExpr && return a.name == b.name
+    a isa IntExpr && b isa IntExpr && return a.value == b.value
+    a isa NumExpr && b isa NumExpr && return a.value == b.value
+    a isa IntExpr && b isa NumExpr && return a.value == b.value
+    a isa NumExpr && b isa IntExpr && return a.value == b.value
+    if a isa OpExpr && b isa OpExpr
+        a.op == b.op || return false
+        length(a.args) == length(b.args) || return false
+        return all(((x, y),) -> _ast_equal(x, y), zip(a.args, b.args))
     end
     return false
 end
 
-"""
-    stencil_vs_pointwise(term::ASTExpr) -> Int
+_cells_equal(a::Vector{ASTExpr}, b::Vector{ASTExpr}) =
+    length(a) == length(b) && all(((x, y),) -> _ast_equal(x, y), zip(a, b))
 
-Example binary rule: `1` if `term` contains a stencil op ([`has_stencil_op`](@ref)),
-else `2`. Places (discretized) transport terms in part 1 and pointwise terms in
-part 2 — the usual convention for treating transport implicitly under IMEX.
-"""
-stencil_vs_pointwise(term::ASTExpr)::Int = has_stencil_op(term) ? 1 : 2
+# An `output_idx` field (`Vector{Any}` of index-symbol `String`s / literal
+# `Int`s) as a cell tuple of `ASTExpr`.
+_output_idx_cell(oi) = ASTExpr[e isa Integer ? IntExpr(Int64(e)) : VarExpr(String(e)) for e in oi]
 
 """
-    spatial_vs_pointwise(term::ASTExpr) -> Int
+    spatially_coupled(term::ASTExpr, ctx::TermContext) -> Bool
 
-Example binary rule for a **pre-discretization** system: `1` if `term` contains
-a spatial derivative ([`is_spatial_derivative`](@ref)), else `2`.
+`true` if `term` reads a state variable at a cell **other than** the equation's
+own output cell — i.e. it couples distinct grid cells (a transport /
+finite-difference / nonlocal term). `false` for a purely **pointwise** term
+that reads state only at the output cell (a reaction / source / local term).
+This is the representation-independent transport-vs-pointwise criterion; see
+[`transport_vs_pointwise`](@ref) for the rule built on it.
+
+State access is assumed to be by bare reference (whole-field / 0-D, always
+local) or `index(state, …)`; the output cell is the index on the `D(…)`
+left-hand side, or — inside an `aggregate`/`arrayop` — that node's `output_idx`.
 """
-spatial_vs_pointwise(term::ASTExpr)::Int = is_spatial_derivative(term) ? 1 : 2
+spatially_coupled(term::ASTExpr, ctx::TermContext)::Bool =
+    _reads_nonlocal(term, _lhs_cell(ctx.lhs), ctx.states)
+
+_lhs_cell(lhs::ASTExpr) = _lhs_state_cell(lhs)[2]  # nothing (field/0-D) or Vector
+
+# Does `node` read any state at a cell ≠ the current output cell `oc`
+# (`nothing` = the field/elementwise output; `Vector` = a concrete/symbolic
+# index tuple, e.g. from the LHS or an enclosing aggregate)?
+function _reads_nonlocal(node::ASTExpr, oc, states::Set{String})::Bool
+    if node isa VarExpr
+        # a bare state reference is elementwise ⇒ always the output cell (local)
+        return false
+    elseif node isa IntExpr || node isa NumExpr
+        return false
+    elseif node isa OpExpr
+        if node.op == "index" && !isempty(node.args) && node.args[1] isa VarExpr &&
+           _base_name(node.args[1].name) in states
+            readcell = ASTExpr[node.args[2:end]...]
+            # local iff it reads the current output cell; a fixed-cell read in a
+            # field equation (oc === nothing) is nonlocal by definition.
+            if oc === nothing || !_cells_equal(readcell, oc)
+                return true
+            end
+            # still descend into the index expressions (they may themselves
+            # gather state, e.g. an indirect/gather index).
+            return any(a -> _reads_nonlocal(a, oc, states), node.args[2:end])
+        end
+        # entering an aggregate/arrayop rebinds the output cell to its output_idx
+        child_oc = oc
+        if (node.op == "aggregate" || node.op == "arrayop") && node.output_idx !== nothing
+            child_oc = _output_idx_cell(node.output_idx)
+        end
+        for c in _child_exprs(node)
+            _reads_nonlocal(c, child_oc, states) && return true
+        end
+        return false
+    end
+    return false
+end
+
+# Every `ASTExpr`-valued child of an `OpExpr` (args plus the structural fields
+# that carry sub-expressions: stencil bodies, bounds, makearray values, …).
+function _child_exprs(node::OpExpr)::Vector{ASTExpr}
+    cs = ASTExpr[]
+    append!(cs, node.args)
+    node.expr_body === nothing || push!(cs, node.expr_body)
+    node.lower === nothing || push!(cs, node.lower)
+    node.upper === nothing || push!(cs, node.upper)
+    node.key === nothing || push!(cs, node.key)
+    node.filter === nothing || push!(cs, node.filter)
+    node.values === nothing || append!(cs, node.values)
+    if node.table_axes !== nothing
+        append!(cs, values(node.table_axes))
+    end
+    return cs
+end
+
+"""
+    transport_vs_pointwise(term::ASTExpr, ctx::TermContext) -> Int
+
+The default two-way splitting rule: `1` (transport) if `term` is
+[`spatially_coupled`](@ref) — it reads state at another cell — else `2`
+(pointwise / reaction). Part 1 is the transport operator, part 2 the pointwise
+operator, matching the usual IMEX convention of treating transport implicitly.
+
+This is a *context-aware* rule: pass it straight to [`build_split_evaluator`](@ref)
+/ [`split_system`](@ref) / [`split_equations`](@ref), which supply the
+`TermContext`.
+"""
+transport_vs_pointwise(term::ASTExpr, ctx::TermContext)::Int =
+    spatially_coupled(term, ctx) ? 1 : 2
 
 # ---------------------------------------------------------------------------
 # Equation splitting
@@ -272,16 +373,31 @@ _is_time_derivative_eq(eq::Equation)::Bool =
     eq.lhs isa OpExpr && eq.lhs.op == "D" &&
     (eq.lhs.wrt === nothing || eq.lhs.wrt == "t")
 
+# Apply a rule that is either `rule(term)` or context-aware `rule(term, ctx)`.
+function _apply_rule(rule, term::ASTExpr, ctx::TermContext)
+    if applicable(rule, term, ctx)
+        return rule(term, ctx)
+    elseif applicable(rule, term)
+        return rule(term)
+    end
+    throw(ArgumentError(
+        "rule is not callable as rule(term) or rule(term, ctx::TermContext)"))
+end
+
 """
     split_equations(equations, rule; nparts=2) -> Vector{Vector{Equation}}
 
 Partition a list of `Equation`s into `nparts` equation lists.
 
 For each **time-derivative** equation `D(x, t) ~ rhs`, `rhs` is decomposed with
-[`additive_terms`](@ref) and each term is assigned to a part by
-`rule(term)::Int` (a value in `1:nparts`). Every part then receives one
-equation `D(x, t) ~ sum_of_its_terms` (an empty part gets `~ 0`), so each part
-still covers `x`.
+[`additive_terms`](@ref) and each term is assigned to a part in `1:nparts` by
+`rule`. A rule is either `rule(term)::Int` or the context-aware form
+`rule(term, ctx::TermContext)::Int` (the context carries the equation's LHS and
+the state-variable names — needed by locality-based rules like
+[`transport_vs_pointwise`](@ref)); `split_equations` dispatches on whichever the
+rule accepts. Every part then receives one equation
+`D(x, t) ~ sum_of_its_terms` (an empty part gets `~ 0`), so each part still
+covers `x`.
 
 Every **non**-time-derivative equation (observed definitions, `ic` equations) is
 copied unchanged into *all* parts, because each part must evaluate the shared
@@ -290,12 +406,14 @@ observeds.
 function split_equations(equations::AbstractVector{Equation}, rule;
                          nparts::Integer = 2)::Vector{Vector{Equation}}
     nparts >= 1 || throw(ArgumentError("nparts must be >= 1, got $nparts"))
+    states = _state_base_names(equations)
     parts = [Equation[] for _ in 1:nparts]
     for eq in equations
         if _is_time_derivative_eq(eq)
+            ctx = TermContext(eq.lhs, states)
             buckets = [ASTExpr[] for _ in 1:nparts]
             for term in additive_terms(eq.rhs)
-                p = rule(term)
+                p = _apply_rule(rule, term, ctx)
                 (p isa Integer && 1 <= p <= nparts) ||
                     throw(ArgumentError(
                         "rule returned $(repr(p)); expected an Integer in 1:$nparts"))

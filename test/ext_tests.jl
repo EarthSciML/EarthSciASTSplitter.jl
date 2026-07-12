@@ -23,7 +23,7 @@ end
 
 @testset "extensions" begin
     flat = flatten(load(joinpath(ESMDIR, "reaction_advection_1d.esm")))
-    se = build_split_evaluator(flat, stencil_vs_pointwise)   # (transport, reaction)
+    se = build_split_evaluator(flat, transport_vs_pointwise)   # (transport, reaction)
 
     @testset "SciMLBase: split_ode_problem" begin
         prob = split_ode_problem(se)
@@ -69,7 +69,7 @@ end
         #     to pure linear-decay reaction: every cell → (1 - dt*k)^N exactly (k=0.5).
         f0!, u0, p0, _, var_map = build_evaluator(flat)
         ic = Dict(name => 1.0 for name in keys(var_map))
-        se_c = build_split_evaluator(flat, stencil_vs_pointwise; initial_conditions=ic)
+        se_c = build_split_evaluator(flat, transport_vs_pointwise; initial_conditions=ic)
         integ_c = init(operator_splitting_problem(se_c), alg; dt=dt)
         for _ in 1:N; step!(integ_c); end
         expected = (1 - dt*0.5)^N

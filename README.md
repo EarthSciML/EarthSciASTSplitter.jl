@@ -55,9 +55,10 @@ using EarthSciAST, EarthSciASTSplitter
 
 flat = flatten(load("model.esm"))        # a post-discretization FlattenedSystem
 
-# A rule maps one additive term (an `ASTExpr`) to a part index in 1:nparts.
-# Built-in example rule: stencil/transport → part 1, pointwise → part 2.
-se = build_split_evaluator(flat, stencil_vs_pointwise)
+# A rule maps one additive term to a part index in 1:nparts. The default rule
+# `transport_vs_pointwise` puts spatially-coupled (transport) terms in part 1
+# and pointwise (reaction) terms in part 2.
+se = build_split_evaluator(flat, transport_vs_pointwise)
 
 # se.funcs :: NTuple of in-place f!(du,u,p,t); se.u0, se.p, se.tspan, se.var_map
 
@@ -76,22 +77,40 @@ for _ in 1:200; step!(integ); end                    # or TimeChoiceIterator(int
 u_final = integ.u
 ```
 
+### The default rule: spatial locality (not a stencil heuristic)
+
+`grad`/`div`/`laplacian` are **not** meaningful operators in EarthSciAST v0.8+
+— they are ordinary tokens that expression templates rewrite into arbitrary
+stencil ASTs — so a transport term cannot be recognized by any fixed op name.
+What is invariant is the **data dependency**:
+
+> a term is **pointwise** if, in the (discretized) equation for a state cell, it
+> reads state only at that same cell; it is **transport** (spatially coupled) if
+> it reads state at another cell — a neighbor, a boundary cell, or a range it
+> reduces over.
+
+`transport_vs_pointwise(term, ctx)` decides this by comparing, for every state
+read in the term, the cell it accesses against the equation's output cell. It is
+representation-independent: it works whether the stencil is a `makearray`, a
+scalarized `index(u, i-1)`, or an `aggregate` reduction, and it correctly keeps
+a multi-species same-cell reaction (`k·c1[i]·c2[i]`) on the pointwise side.
+
 ### Writing your own rule
 
-A rule is any `term::ASTExpr -> Int` (a part index in `1:nparts`). Helpers:
+A rule is any `term::ASTExpr -> Int`, or a context-aware
+`(term, ctx::TermContext) -> Int` where `ctx` carries the equation's LHS and the
+state-variable names (`split_equations` supplies it and dispatches on whichever
+form the rule accepts). Helpers:
 
 | Helper | Meaning |
 |---|---|
+| `spatially_coupled(term, ctx)` | the real transport test — term reads state at a cell ≠ the output cell |
+| `transport_vs_pointwise(term, ctx)` | default rule: `1` if `spatially_coupled`, else `2` |
 | `references(term, names)` | term mentions any variable in `names` |
-| `contains_op(term, ops)` | term contains any `OpExpr` whose `op ∈ ops` |
-| `has_stencil_op(term)` | term contains a `makearray`/`aggregate`/`arrayop` (`STENCIL_OPS`) |
-| `is_spatial_derivative(term)` | term contains `grad`/`div`/`laplacian` or a `D` w.r.t. a spatial variable (`SPATIAL_DERIVATIVE_OPS`) — for splitting **before** discretization |
-
-Prebuilt example rules: `stencil_vs_pointwise` (post-discretization) and
-`spatial_vs_pointwise` (pre-discretization). Both put the "PDE" part first.
+| `contains_op(term, ops)` | term contains any `OpExpr` whose `op ∈ ops` (generic; op names carry no fixed meaning) |
 
 ```julia
-# implicit part = anything touching species c1 or c2; explicit = the rest
+# a custom rule: implicit part = anything touching species c1 or c2
 rule = term -> references(term, ("c1", "c2")) ? 1 : 2
 se = build_split_evaluator(flat, rule; nparts = 2)
 ```

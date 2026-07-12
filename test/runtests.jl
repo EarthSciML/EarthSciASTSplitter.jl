@@ -38,22 +38,42 @@ Dt(v) = OpExpr("D", ASTExpr[V(v)], wrt="t")
         @test sum_terms(ASTExpr[V("a")]) == V("a")
     end
 
-    @testset "rule helpers" begin
-        e = O("*", V("k"), O("grad", V("u")))
+    idx(v, a...) = OpExpr("index", ASTExpr[V(v), a...])
+    Dof(inner) = OpExpr("D", ASTExpr[inner], wrt="t")
+
+    @testset "generic rule helpers" begin
+        e = O("*", V("k"), idx("u", V("i")))
         @test references(e, "k")
         @test references(e, ["q", "u"])
         @test !references(e, "z")
-        @test contains_op(e, "grad")
-        @test contains_op(e, SPATIAL_DERIVATIVE_OPS)
-        @test !contains_op(e, STENCIL_OPS)
-        @test is_spatial_derivative(e)
-        @test is_spatial_derivative(OpExpr("D", ASTExpr[V("u")], wrt="x"))   # spatial D
-        @test !is_spatial_derivative(OpExpr("D", ASTExpr[V("u")], wrt="t"))  # time D
-        @test has_stencil_op(O("*", V("c"), O("makearray", )))
-        @test stencil_vs_pointwise(O("makearray", )) == 1
-        @test stencil_vs_pointwise(O("*", V("k"), V("x"))) == 2
-        @test spatial_vs_pointwise(O("grad", V("u"))) == 1
-        @test spatial_vs_pointwise(O("*", V("k"), V("x"))) == 2
+        @test contains_op(e, "index")
+        @test contains_op(e, ("index", "aggregate"))
+        @test !contains_op(e, "makearray")
+    end
+
+    @testset "spatial locality (real transport-vs-pointwise rule)" begin
+        # output cell = u[3]
+        ctx3 = TermContext(Dof(idx("u", IntExpr(3))), Set(["u"]))
+        # neighbor reads ⇒ transport
+        @test spatially_coupled(idx("u", IntExpr(4)), ctx3)
+        @test spatially_coupled(O("-", idx("u", IntExpr(4)), idx("u", IntExpr(2))), ctx3)
+        # same-cell read ⇒ pointwise
+        @test !spatially_coupled(O("*", V("k"), idx("u", IntExpr(3))), ctx3)
+        # multi-species, SAME cell ⇒ pointwise (a naive per-variable rule fails here)
+        ctxc = TermContext(Dof(idx("c1", IntExpr(3))), Set(["c1", "c2"]))
+        @test !spatially_coupled(O("*", idx("c1", IntExpr(3)), idx("c2", IntExpr(3))), ctxc)
+        # 0-D / bare field reference ⇒ pointwise
+        ctxf = TermContext(Dof(V("u")), Set(["u"]))
+        @test !spatially_coupled(O("*", V("k"), V("u")), ctxf)
+        # a fixed-cell read in a field equation ⇒ transport (boundary coupling)
+        @test spatially_coupled(idx("u", IntExpr(1)), ctxf)
+        # an aggregate that reduces a state over a range ⇒ transport (nonlocal)
+        agg = OpExpr("aggregate", ASTExpr[]; output_idx=Any["i"],
+                     expr_body=idx("u", V("j")))   # reads j ≠ output i
+        @test spatially_coupled(agg, ctxf)
+        # transport_vs_pointwise wraps it: 1 = transport, 2 = pointwise
+        @test transport_vs_pointwise(idx("u", IntExpr(4)), ctx3) == 1
+        @test transport_vs_pointwise(O("*", V("k"), idx("u", IntExpr(3))), ctx3) == 2
     end
 
     # Shared model: D(x,t) ~ -k*x + a*y ;  D(y,t) ~ x*y - k
@@ -170,7 +190,7 @@ Dt(v) = OpExpr("D", ASTExpr[V(v)], wrt="t")
             @test flat.independent_variables == [:t]        # discretized ⇒ pure ODE
             f0!, u0, p0, _, _ = build_evaluator(flat)
             @test length(u0) == 8                            # N = 8 grid
-            se = build_split_evaluator(flat, stencil_vs_pointwise)
+            se = build_split_evaluator(flat, transport_vs_pointwise)
             @test length(se.funcs) == 2
             u = nonuniform(length(u0))
             du_full = similar(u); f0!(du_full, u, p0, 0.0)
@@ -184,7 +204,7 @@ Dt(v) = OpExpr("D", ASTExpr[V(v)], wrt="t")
 
     @testset "reaction+transport split isolates the operators" begin
         flat = flatten(load(joinpath(esmdir, "reaction_advection_1d.esm")))
-        se = build_split_evaluator(flat, stencil_vs_pointwise)
+        se = build_split_evaluator(flat, transport_vs_pointwise)
         u = nonuniform(length(se.u0))
         d_transport = similar(u); se.funcs[1](d_transport, u, se.p, 0.0)  # stencil part
         d_reaction  = similar(u); se.funcs[2](d_reaction,  u, se.p, 0.0)  # pointwise part
