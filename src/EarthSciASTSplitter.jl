@@ -63,7 +63,7 @@ export additive_terms, sum_terms,
        split_equations, split_system, build_split_evaluator, SplitEvaluator,
        split_ode_problem, operator_splitting_problem,
        TermContext, references, contains_op,
-       spatially_coupled, transport_vs_pointwise
+       spatially_coupled, transport_vs_pointwise, stencil_vs_pointwise
 
 """
     split_ode_problem(se::SplitEvaluator; kwargs...)
@@ -246,13 +246,20 @@ function _lhs_state_cell(lhs::ASTExpr)
     return (nothing, nothing)
 end
 
-# The base state names declared by a set of equations (one per `D(state,t)`).
+# The base state names declared by a set of equations — one per plain `D(state,t)`
+# and one per pointwise-lifted `aggregate(… D(index(state,…),t))` (esm-spec v0.8+).
 function _state_base_names(equations)::Set{String}
     s = Set{String}()
     for eq in equations
-        _is_time_derivative_eq(eq) || continue
-        name, _ = _lhs_state_cell(eq.lhs)
-        name === nothing || push!(s, name)
+        if _is_time_derivative_eq(eq)
+            name, _ = _lhs_state_cell(eq.lhs)
+            name === nothing || push!(s, name)
+        else
+            lifted = _lifted_derivative(eq)
+            lifted === nothing && continue
+            name, _ = _lhs_state_cell(lifted[1])   # inner D(index(state,…),t)
+            name === nothing || push!(s, name)
+        end
     end
     return s
 end
@@ -365,6 +372,22 @@ This is a *context-aware* rule: pass it straight to [`build_split_evaluator`](@r
 transport_vs_pointwise(term::ASTExpr, ctx::TermContext)::Int =
     spatially_coupled(term, ctx) ? 1 : 2
 
+"""
+    stencil_vs_pointwise(term::ASTExpr, ctx::TermContext) -> Int
+
+Splitting rule for **post-lift, materialized-stencil** systems (EarthSciAST
+v0.8+). After the pointwise lift + discretization, a spatial-derivative term is
+lowered to an indexed `makearray` (`index(makearray(…stencil…), i, j, k)`) whose
+neighbor reads are hidden inside a still-`apply_expression_template`-referenced
+body — so the pure data-dependency test [`spatially_coupled`](@ref) cannot see
+them and returns `false`. This rule marks a term transport (`1`) when it either
+contains a `makearray` (a materialized stencil) **or** is
+[`spatially_coupled`](@ref); otherwise pointwise (`2`). On a system with no
+`makearray` it reduces exactly to [`transport_vs_pointwise`](@ref).
+"""
+stencil_vs_pointwise(term::ASTExpr, ctx::TermContext)::Int =
+    (contains_op(term, "makearray") || spatially_coupled(term, ctx)) ? 1 : 2
+
 # ---------------------------------------------------------------------------
 # Equation splitting
 # ---------------------------------------------------------------------------
@@ -372,6 +395,35 @@ transport_vs_pointwise(term::ASTExpr, ctx::TermContext)::Int =
 _is_time_derivative_eq(eq::Equation)::Bool =
     eq.lhs isa OpExpr && eq.lhs.op == "D" &&
     (eq.lhs.wrt === nothing || eq.lhs.wrt == "t")
+
+# esm-spec v0.8+ POINTWISE LIFT: a per-cell state ODE is materialized as an
+# `aggregate` over the grid whose body is the scalar derivative equation:
+#     lhs = aggregate(output_idx=…, ranges=…, expr_body = D(index(state, …), t))
+#     rhs = aggregate(output_idx=…, ranges=…, expr_body = <per-cell tendency>)
+# The additive split therefore has to happen on the INNER `expr_body`, not on the
+# aggregate (which is a single indivisible term to `additive_terms`).
+# `_lifted_derivative` recognizes this shape and returns
+#   (inner_lhs, inner_body, rebuild)
+# where `inner_lhs` is the scalar `D(...)` (for a correct output-cell TermContext),
+# `inner_body` is the tendency to split, and `rebuild(body)` re-wraps a split body
+# in a copy of the original rhs aggregate. Returns `nothing` for any non-lifted eq.
+function _lifted_derivative(eq::Equation)
+    lhs = eq.lhs; rhs = eq.rhs
+    (lhs isa OpExpr && lhs.op == "aggregate" && lhs.expr_body isa OpExpr) || return nothing
+    (rhs isa OpExpr && rhs.op == "aggregate" && rhs.expr_body !== nothing) || return nothing
+    inner = lhs.expr_body
+    (inner.op == "D" && (inner.wrt === nothing || inner.wrt == "t")) || return nothing
+    return (inner, rhs.expr_body, body -> _rebuild_expr_body(rhs, body))
+end
+
+# A copy of aggregate `agg` with its `expr_body` replaced (OpExpr is a mutable
+# struct, so `deepcopy` + field set keeps every other field — output_idx, ranges,
+# reduce, semiring, regions, … — intact and structurally independent per part).
+function _rebuild_expr_body(agg::OpExpr, newbody::ASTExpr)::OpExpr
+    new = deepcopy(agg)
+    new.expr_body = newbody
+    return new
+end
 
 # Apply a rule that is either `rule(term)` or context-aware `rule(term, ctx)`.
 function _apply_rule(rule, term::ASTExpr, ctx::TermContext)
@@ -410,24 +462,45 @@ function split_equations(equations::AbstractVector{Equation}, rule;
     parts = [Equation[] for _ in 1:nparts]
     for eq in equations
         if _is_time_derivative_eq(eq)
+            # plain scalar / whole-field ODE: split the RHS directly.
             ctx = TermContext(eq.lhs, states)
-            buckets = [ASTExpr[] for _ in 1:nparts]
-            for term in additive_terms(eq.rhs)
-                p = _apply_rule(rule, term, ctx)
-                (p isa Integer && 1 <= p <= nparts) ||
-                    throw(ArgumentError(
-                        "rule returned $(repr(p)); expected an Integer in 1:$nparts"))
-                push!(buckets[p], term)
-            end
-            for p in 1:nparts
-                push!(parts[p], Equation(eq.lhs, sum_terms(buckets[p]);
-                                         _comment = eq._comment))
-            end
+            _push_split!(parts, eq.lhs, eq.rhs, identity, ctx, rule, nparts, eq._comment)
         else
-            for p in 1:nparts
-                push!(parts[p], eq)
+            lifted = _lifted_derivative(eq)
+            if lifted !== nothing
+                # pointwise-lifted ODE: split the aggregate's INNER tendency body,
+                # using the scalar D(...) as the TermContext so locality rules see
+                # the true per-cell output index.
+                inner_lhs, inner_body, rebuild = lifted
+                ctx = TermContext(inner_lhs, states)
+                _push_split!(parts, eq.lhs, inner_body, rebuild, ctx, rule, nparts,
+                             eq._comment)
+            else
+                # non-derivative (observed / ic): copy unchanged into every part.
+                for p in 1:nparts
+                    push!(parts[p], eq)
+                end
             end
         end
+    end
+    return parts
+end
+
+# Partition `body`'s additive terms into `nparts` buckets by `rule`, then push one
+# equation per part: `Equation(lhs, rebuild(sum_of_its_terms))`. `rebuild` is
+# `identity` for a plain RHS or the aggregate re-wrapper for a lifted body.
+function _push_split!(parts, lhs, body, rebuild, ctx::TermContext, rule,
+                      nparts::Integer, comment)
+    buckets = [ASTExpr[] for _ in 1:nparts]
+    for term in additive_terms(body)
+        p = _apply_rule(rule, term, ctx)
+        (p isa Integer && 1 <= p <= nparts) ||
+            throw(ArgumentError(
+                "rule returned $(repr(p)); expected an Integer in 1:$nparts"))
+        push!(buckets[p], term)
+    end
+    for p in 1:nparts
+        push!(parts[p], Equation(lhs, rebuild(sum_terms(buckets[p])); _comment = comment))
     end
     return parts
 end

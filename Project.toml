@@ -15,7 +15,7 @@ EarthSciASTSplitterOperatorSplittingExt = ["OrdinaryDiffEqOperatorSplitting", "S
 EarthSciASTSplitterSciMLBaseExt = "SciMLBase"
 
 [compat]
-EarthSciAST = "0.8"
+EarthSciAST = "0.8, 0.9"
 OrdinaryDiffEqLowOrderRK = "1, 2"
 OrdinaryDiffEqOperatorSplitting = "0.3"
 SciMLBase = "2, 3"
